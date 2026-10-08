@@ -2,7 +2,7 @@ const http = require("http");
 const crypto = require("crypto");
 const db = require("./database");
 
-const PORT = 4242;
+const PORT = process.env.PORT || 8080;
 
 function sendJson(res, status, data) {
   const body = JSON.stringify(data, null, 2);
@@ -2390,13 +2390,9 @@ server.on("error", error => {
   );
 });
 
-server.listen(
-  PORT,
-  () => {
-    console.log(
-      "YourPay running at http://localhost:" +
-      PORT
-    );
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`YourPay running on port ${PORT}`);
+});
 
     console.log(
       "Persistent database: data/database.json"
