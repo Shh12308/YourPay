@@ -1,3 +1,4 @@
+
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
@@ -12,7 +13,8 @@ const emptyDatabase = {
   merchants: [],
   apiKeys: [],
   customers: [],
-  payments: []
+  payments: [],
+  paymentLinks: []
 };
 
 let pool = null;
@@ -54,7 +56,10 @@ function loadLocalDatabase() {
     merchants: Array.isArray(data.merchants) ? data.merchants : [],
     apiKeys: Array.isArray(data.apiKeys) ? data.apiKeys : [],
     customers: Array.isArray(data.customers) ? data.customers : [],
-    payments: Array.isArray(data.payments) ? data.payments : []
+    payments: Array.isArray(data.payments) ? data.payments : [],
+    paymentLinks: Array.isArray(data.paymentLinks)
+      ? data.paymentLinks
+      : []
   };
 }
 
@@ -83,9 +88,7 @@ function makeId(prefix) {
 }
 
 function normalizeMerchant(row) {
-  if (!row) {
-    return null;
-  }
+  if (!row) return null;
 
   return {
     id: row.id,
@@ -95,9 +98,7 @@ function normalizeMerchant(row) {
 }
 
 function normalizeApiKey(row) {
-  if (!row) {
-    return null;
-  }
+  if (!row) return null;
 
   return {
     id: row.id,
@@ -110,9 +111,7 @@ function normalizeApiKey(row) {
 }
 
 function normalizeCustomer(row) {
-  if (!row) {
-    return null;
-  }
+  if (!row) return null;
 
   return {
     id: row.id,
@@ -124,9 +123,7 @@ function normalizeCustomer(row) {
 }
 
 function normalizePayment(row) {
-  if (!row) {
-    return null;
-  }
+  if (!row) return null;
 
   return {
     id: row.id,
@@ -141,16 +138,24 @@ function normalizePayment(row) {
   };
 }
 
+function normalizePaymentLink(row) {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    merchantId: row.merchant_id || row.merchantId,
+    title: row.title,
+    amount: Number(row.amount),
+    currency: String(row.currency || "gbp").toLowerCase(),
+    active: row.active === true || row.active === "true",
+    createdAt: row.created_at || row.createdAt
+  };
+}
+
 async function initialize() {
-  if (initialized) {
-    return;
-  }
+  if (initialized) return;
 
   if (USE_POSTGRES) {
-    if (!process.env.DATABASE_URL) {
-      throw new Error("DATABASE_URL is required.");
-    }
-
     const { Pool } = require("pg");
 
     pool = new Pool({
@@ -196,6 +201,12 @@ async function initialize() {
       )
     `);
 
+    // Create this index before payments references it.
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS customers_id_merchant_unique
+      ON customers (id, merchant_id)
+    `);
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS payments (
         id TEXT PRIMARY KEY,
@@ -213,8 +224,15 @@ async function initialize() {
     `);
 
     await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS customers_id_merchant_unique
-      ON customers (id, merchant_id)
+      CREATE TABLE IF NOT EXISTS payment_links (
+        id TEXT PRIMARY KEY,
+        merchant_id TEXT NOT NULL REFERENCES merchants(id),
+        title TEXT NOT NULL,
+        amount BIGINT NOT NULL CHECK (amount > 0),
+        currency TEXT NOT NULL,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
     `);
 
     await pool.query(`
@@ -235,6 +253,11 @@ async function initialize() {
     await pool.query(`
       CREATE INDEX IF NOT EXISTS payments_merchant_customer_idx
       ON payments (merchant_id, customer_id)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS payment_links_merchant_created_idx
+      ON payment_links (merchant_id, created_at DESC)
     `);
 
     const result = await pool.query(
@@ -259,6 +282,10 @@ async function initialize() {
 
     if (!Array.isArray(database.payments)) {
       database.payments = [];
+    }
+
+    if (!Array.isArray(database.paymentLinks)) {
+      database.paymentLinks = [];
     }
 
     const firstMerchant = database.merchants[0];
@@ -293,9 +320,7 @@ async function ensureMerchant(name, requestedId) {
       [id, name || "YourPay Merchant"]
     );
 
-    if (!defaultMerchantId) {
-      defaultMerchantId = id;
-    }
+    if (!defaultMerchantId) defaultMerchantId = id;
 
     return normalizeMerchant(result.rows[0]);
   }
@@ -315,17 +340,13 @@ async function ensureMerchant(name, requestedId) {
     saveLocalDatabase();
   }
 
-  if (!defaultMerchantId) {
-    defaultMerchantId = id;
-  }
+  if (!defaultMerchantId) defaultMerchantId = id;
 
   return merchant;
 }
 
 async function getDefaultMerchantId() {
-  if (defaultMerchantId) {
-    return defaultMerchantId;
-  }
+  if (defaultMerchantId) return defaultMerchantId;
 
   if (USE_POSTGRES) {
     const result = await pool.query(
@@ -346,8 +367,7 @@ async function getDefaultMerchantId() {
 }
 
 async function createMerchant(name) {
-  const merchant = await ensureMerchant(name || "YourPay Merchant");
-  return merchant;
+  return ensureMerchant(name || "YourPay Merchant");
 }
 
 async function addApiKey(apiKey) {
@@ -356,29 +376,6 @@ async function addApiKey(apiKey) {
 
   if (!apiKey.keyHash) {
     throw new Error("API key hash is required.");
-  }
-
-  if (USE_POSTGRES) {
-    await pool.query(
-      `INSERT INTO api_keys
-       (id, merchant_id, key_hash, key_prefix, created_at)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [
-        apiKey.id || makeId("key"),
-        merchantId,
-        apiKey.keyHash,
-        apiKey.keyPrefix || "",
-        apiKey.createdAt || new Date().toISOString()
-      ]
-    );
-
-    return {
-      id: apiKey.id,
-      merchantId: merchantId,
-      keyHash: apiKey.keyHash,
-      keyPrefix: apiKey.keyPrefix,
-      createdAt: apiKey.createdAt
-    };
   }
 
   const record = {
@@ -390,10 +387,27 @@ async function addApiKey(apiKey) {
     revokedAt: null
   };
 
+  if (USE_POSTGRES) {
+    const result = await pool.query(
+      `INSERT INTO api_keys
+       (id, merchant_id, key_hash, key_prefix, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [
+        record.id,
+        record.merchantId,
+        record.keyHash,
+        record.keyPrefix,
+        record.createdAt
+      ]
+    );
+
+    return normalizeApiKey(result.rows[0]);
+  }
+
   database.apiKeys.push(record);
   saveLocalDatabase();
-
-  return record;
+  return normalizeApiKey(record);
 }
 
 async function findApiKey(keyHash) {
@@ -434,13 +448,10 @@ async function revokeApiKey(id, merchantId) {
       !item.revokedAt;
   });
 
-  if (!record) {
-    return false;
-  }
+  if (!record) return false;
 
   record.revokedAt = new Date().toISOString();
   saveLocalDatabase();
-
   return true;
 }
 
@@ -476,8 +487,7 @@ async function addCustomer(customer) {
 
   database.customers.push(record);
   saveLocalDatabase();
-
-  return record;
+  return normalizeCustomer(record);
 }
 
 async function getCustomer(id, merchantId) {
@@ -542,11 +552,16 @@ async function addPayment(payment) {
     confirmedAt: payment.confirmedAt || null
   };
 
-  if (
-    !Number.isSafeInteger(record.amount) ||
-    record.amount <= 0
-  ) {
+  if (!Number.isSafeInteger(record.amount) || record.amount <= 0) {
     throw new Error("Payment amount must be a positive safe integer.");
+  }
+
+  if (record.customerId) {
+    const customer = await getCustomer(record.customerId, merchantId);
+
+    if (!customer) {
+      throw new Error("Customer not found for this merchant.");
+    }
   }
 
   if (USE_POSTGRES) {
@@ -572,21 +587,9 @@ async function addPayment(payment) {
     return normalizePayment(result.rows[0]);
   }
 
-  if (record.customerId) {
-    const customer = await getCustomer(
-      record.customerId,
-      merchantId
-    );
-
-    if (!customer) {
-      throw new Error("Customer not found for this merchant.");
-    }
-  }
-
   database.payments.push(record);
   saveLocalDatabase();
-
-  return record;
+  return normalizePayment(record);
 }
 
 async function getPayment(id, merchantId) {
@@ -623,9 +626,7 @@ async function updatePayment(id, updates, merchantId) {
     return Object.prototype.hasOwnProperty.call(allowedFields, key);
   });
 
-  if (!fields.length) {
-    return getPayment(id, merchantId);
-  }
+  if (!fields.length) return getPayment(id, merchantId);
 
   if (
     updates.status &&
@@ -637,19 +638,12 @@ async function updatePayment(id, updates, merchantId) {
   if (USE_POSTGRES) {
     const values = [];
     const assignments = fields.map(function(field) {
-      values.push(
-        field === "confirmedAt" && updates[field]
-          ? updates[field]
-          : updates[field]
-      );
-
+      values.push(updates[field]);
       return allowedFields[field] + " = $" + values.length;
     });
 
     values.push(id);
-    const idParameter = "$" + values.length;
-
-    let where = "id = " + idParameter;
+    let where = "id = $" + values.length;
 
     if (merchantId) {
       values.push(merchantId);
@@ -672,16 +666,13 @@ async function updatePayment(id, updates, merchantId) {
       (!merchantId || item.merchantId === merchantId);
   });
 
-  if (!payment) {
-    return null;
-  }
+  if (!payment) return null;
 
   fields.forEach(function(field) {
     payment[field] = updates[field];
   });
 
   saveLocalDatabase();
-
   return normalizePayment(payment);
 }
 
@@ -722,10 +713,7 @@ async function getStats(merchantId) {
       `SELECT
          COUNT(*) AS payments,
          COUNT(*) FILTER (WHERE status = 'succeeded') AS successful_payments,
-         COALESCE(
-           SUM(amount) FILTER (WHERE status = 'succeeded'),
-           0
-         ) AS total_volume
+         COALESCE(SUM(amount) FILTER (WHERE status = 'succeeded'), 0) AS total_volume
        FROM payments${where}`,
       values
     );
@@ -761,26 +749,153 @@ async function getStats(merchantId) {
     return payment.status === "succeeded";
   });
 
-  const totalVolume = successfulPayments.reduce(function(total, payment) {
-    return total + Number(payment.amount || 0);
-  }, 0);
-
   return {
-    totalVolume: totalVolume,
+    totalVolume: successfulPayments.reduce(function(total, payment) {
+      return total + Number(payment.amount || 0);
+    }, 0),
     successfulPayments: successfulPayments.length,
     customers: customers.length,
     payments: payments.length
   };
 }
 
-async function healthCheck() {
-  if (!initialized) {
-    return false;
+async function createPaymentLink(link) {
+  const merchantId = link.merchantId;
+  const title = String(link.title || "").trim();
+  const amount = Number(link.amount);
+  const currency = String(link.currency || "gbp").toLowerCase();
+
+  if (!merchantId) {
+    throw new Error("Merchant ID is required.");
   }
 
-  if (!USE_POSTGRES) {
-    return true;
+  if (!title || title.length > 120) {
+    throw new Error("Title must be between 1 and 120 characters.");
   }
+
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new Error("Amount must be a positive integer in minor currency units.");
+  }
+
+  if (!/^[a-z]{3}$/.test(currency)) {
+    throw new Error("Currency must be a three-letter code.");
+  }
+
+  const record = {
+    id: link.id || makeId("plink"),
+    merchantId: merchantId,
+    title: title,
+    amount: amount,
+    currency: currency,
+    active: true,
+    createdAt: link.createdAt || new Date().toISOString()
+  };
+
+  if (USE_POSTGRES) {
+    const result = await pool.query(
+      `INSERT INTO payment_links
+       (id, merchant_id, title, amount, currency, active, created_at)
+       VALUES ($1, $2, $3, $4, $5, TRUE, $6)
+       RETURNING *`,
+      [
+        record.id,
+        record.merchantId,
+        record.title,
+        record.amount,
+        record.currency,
+        record.createdAt
+      ]
+    );
+
+    return normalizePaymentLink(result.rows[0]);
+  }
+
+  database.paymentLinks.push(record);
+  saveLocalDatabase();
+  return normalizePaymentLink(record);
+}
+
+async function getPaymentLink(id, merchantId) {
+  if (USE_POSTGRES) {
+    const result = merchantId
+      ? await pool.query(
+          "SELECT * FROM payment_links WHERE id = $1 AND merchant_id = $2",
+          [id, merchantId]
+        )
+      : await pool.query(
+          "SELECT * FROM payment_links WHERE id = $1",
+          [id]
+        );
+
+    return normalizePaymentLink(result.rows[0]);
+  }
+
+  const record = database.paymentLinks.find(function(link) {
+    return link.id === id &&
+      (!merchantId || link.merchantId === merchantId);
+  });
+
+  return normalizePaymentLink(record);
+}
+
+async function getPaymentLinks(merchantId) {
+  if (!merchantId) {
+    throw new Error("Merchant ID is required to list payment links.");
+  }
+
+  if (USE_POSTGRES) {
+    const result = await pool.query(
+      `SELECT * FROM payment_links
+       WHERE merchant_id = $1
+       ORDER BY created_at DESC`,
+      [merchantId]
+    );
+
+    return result.rows.map(normalizePaymentLink);
+  }
+
+  return database.paymentLinks
+    .filter(function(link) {
+      return link.merchantId === merchantId;
+    })
+    .slice()
+    .reverse()
+    .map(normalizePaymentLink);
+}
+
+async function deactivatePaymentLink(id, merchantId) {
+  if (!merchantId) {
+    throw new Error("Merchant ID is required.");
+  }
+
+  if (USE_POSTGRES) {
+    const result = await pool.query(
+      `UPDATE payment_links
+       SET active = FALSE
+       WHERE id = $1 AND merchant_id = $2 AND active = TRUE
+       RETURNING *`,
+      [id, merchantId]
+    );
+
+    return normalizePaymentLink(result.rows[0]);
+  }
+
+  const record = database.paymentLinks.find(function(link) {
+    return link.id === id &&
+      link.merchantId === merchantId &&
+      link.active === true;
+  });
+
+  if (!record) return null;
+
+  record.active = false;
+  saveLocalDatabase();
+  return normalizePaymentLink(record);
+}
+
+async function healthCheck() {
+  if (!initialized) return false;
+  if (!USE_POSTGRES) return true;
 
   try {
     await pool.query("SELECT 1");
@@ -800,9 +915,7 @@ async function close() {
 }
 
 async function save() {
-  if (!USE_POSTGRES) {
-    saveLocalDatabase();
-  }
+  if (!USE_POSTGRES) saveLocalDatabase();
 }
 
 module.exports = {
@@ -824,5 +937,9 @@ module.exports = {
   getPayment,
   updatePayment,
   getPayments,
-  getStats
+  getStats,
+  createPaymentLink,
+  getPaymentLink,
+  getPaymentLinks,
+  deactivatePaymentLink
 };
